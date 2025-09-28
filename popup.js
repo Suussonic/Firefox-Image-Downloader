@@ -98,6 +98,8 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             if (results && results[0]) {
                 pageData = results[0];
+                // Injecter le tabId ici proprement sans casser la syntaxe de l eval
+                pageData.tabId = currentTab.id;
                 allTagImages = pageData.tagImages;
                 displayPageInfo();
             } else {
@@ -105,6 +107,21 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     });
+
+    function buildUnifiedImageList() {
+        // Fusionner toutes les images de toutes les balises dans un tableau unique
+        const list = [];
+        Object.keys(allTagImages).forEach(tag => {
+            (allTagImages[tag] || []).forEach(img => {
+                // Normaliser structure à {url, filename}
+                list.push({
+                    url: img.url,
+                    filename: img.filename || (tag + '_' + list.length + '.jpg')
+                });
+            });
+        });
+        return list;
+    }
 
     function displayPageInfo() {
         loadingDiv.style.display = 'none';
@@ -118,9 +135,11 @@ document.addEventListener('DOMContentLoaded', function() {
             if (i === 0) opt.selected = true;
             zipTitleSelect.appendChild(opt);
         });
-        zipNameSpan.textContent = zipTitleSelect.value + '.zip';
-        zipTitleSelect.onchange = function() {
+        if (zipNameSpan) {
             zipNameSpan.textContent = zipTitleSelect.value + '.zip';
+        }
+        zipTitleSelect.onchange = function() {
+            if (zipNameSpan) zipNameSpan.textContent = zipTitleSelect.value + '.zip';
         };
         updateImagePreview();
         updateTagLabel();
@@ -197,10 +216,18 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     downloadBtn.addEventListener('click', function() {
-        if (!pageData || pageData.images.length === 0) {
+        if (!pageData) {
+            showError('Données de page absentes');
+            return;
+        }
+        // Construire/mettre à jour la liste unifiée des images avant d envoyer
+        const unified = buildUnifiedImageList();
+        if (!unified.length) {
             showError('Aucune image à télécharger');
             return;
         }
+        // Ajouter dynamiquement la propriété images attendue par le background
+        pageData.images = unified;
 
         downloadBtn.disabled = true;
         progressDiv.style.display = 'block';
@@ -222,8 +249,8 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 
     // Écouter les mises à jour de progression
-    chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
-        if (message.action === 'downloadProgress') {
+    chrome.runtime.onMessage.addListener(function(message) {
+        if (message && message.action === 'downloadProgress') {
             updateProgress(message.current, message.total);
         }
     });

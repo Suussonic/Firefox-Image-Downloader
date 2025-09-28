@@ -11,6 +11,7 @@ async function downloadImagesAsZip(pageData, sendResponse) {
         const images = pageData.images;
         let downloadedCount = 0;
         const zipFiles = [];
+        const errorReasons = [];
         
         if (images.length === 0) {
             sendResponse({ success: false, error: 'Aucune image trouvée' });
@@ -20,13 +21,48 @@ async function downloadImagesAsZip(pageData, sendResponse) {
         // Fonction pour télécharger une image
         async function downloadImage(imageData, index) {
             try {
-                const response = await fetch(imageData.url);
-                if (!response.ok) {
-                    console.warn(`Échec du téléchargement de l'image ${index + 1}: ${response.status}`);
-                    return null;
+                let arrayBuffer;
+                const url = imageData.url;
+                if (url.startsWith('data:')) {
+                    // data URI direct
+                    const base64 = url.split(',')[1];
+                    arrayBuffer = Uint8Array.from(atob(base64), c => c.charCodeAt(0)).buffer;
+                } else if (url.startsWith('blob:')) {
+                    // Nécessite exécution dans l onglet pour récupérer le blob
+                    const tabId = pageData.tabId;
+                    if (typeof tabId === 'number') {
+                        try {
+                            const result = await new Promise((resolve, reject) => {
+                                chrome.tabs.executeScript(tabId, {
+                                    code: `fetch('${url}').then(r=>r.arrayBuffer()).then(b=>{ Array.from(new Uint8Array(b)) }).catch(e=>'ERROR:'+e.message);`
+                                }, res => {
+                                    if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                    else resolve(res && res[0]);
+                                });
+                            });
+                            if (typeof result === 'string' && result.startsWith('ERROR:')) {
+                                console.warn('Échec blob fetch', result);
+                                errorReasons.push('blob fetch');
+                                return null;
+                            }
+                            arrayBuffer = new Uint8Array(result).buffer;
+                        } catch(e) {
+                            console.warn('Blob non récupéré', e);
+                            errorReasons.push('blob exception');
+                            return null;
+                        }
+                    } else {
+                        return null;
+                    }
+                } else {
+                    const response = await fetch(url, { mode: 'cors' });
+                    if (!response.ok) {
+                        console.warn(`Échec du téléchargement de l'image ${index + 1}: ${response.status}`);
+                        errorReasons.push('HTTP ' + response.status);
+                        return null;
+                    }
+                    arrayBuffer = await response.arrayBuffer();
                 }
-                
-                const arrayBuffer = await response.arrayBuffer();
                 
                 // Générer un nom de fichier unique
                 let filename = imageData.filename || `image_${index + 1}.jpg`;
@@ -58,21 +94,19 @@ async function downloadImagesAsZip(pageData, sendResponse) {
                     downloadedCount++;
                     
                     // Envoyer la progression
-                    chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
-                        if (tabs[0]) {
-                            chrome.tabs.sendMessage(tabs[0].id, {
-                                action: 'downloadProgress',
-                                current: downloadedCount,
-                                total: images.length
-                            });
-                        }
+                    // Diffuser la progression pour que la popup puisse l'afficher
+                    chrome.runtime.sendMessage({
+                        action: 'downloadProgress',
+                        current: downloadedCount,
+                        total: images.length
                     });
                 }
             });
         }
         
         if (downloadedCount === 0) {
-            sendResponse({ success: false, error: 'Aucune image n\'a pu être téléchargée' });
+            const uniq = [...new Set(errorReasons)].slice(0,5).join(', ') || 'inconnue';
+            sendResponse({ success: false, error: `Aucune image n'a pu être téléchargée (causes: ${uniq})` });
             return;
         }
         
