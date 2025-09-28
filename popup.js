@@ -73,10 +73,39 @@ document.addEventListener('DOMContentLoaded', function() {
                                 const img = el.querySelector('img');
                                 url = img && img.src ? img.src : '';
                             }
+                            // Extraire meilleure source potentielle depuis srcset
+                            let bestFromSrcSet = '';
+                            const baseImg = (tag === 'img') ? el : el.querySelector('img');
+                            if (baseImg && baseImg.srcset) {
+                                const candidates = baseImg.srcset.split(',').map(s=>s.trim()).map(part => {
+                                    // formats possibles: URL 100w | URL 2x
+                                    const mW = part.match(/([^\s]+)\s+(\d+)w/);
+                                    const mX = part.match(/([^\s]+)\s+(\d+(?:\.\d+)?)x/);
+                                    if (mW) return { url: mW[1], score: parseInt(mW[2]) };
+                                    if (mX) return { url: mX[1], score: parseFloat(mX[2]) * 10000 }; // densité * facteur arbitraire
+                                    return { url: part.split(' ')[0], score: 1 };
+                                });
+                                candidates.sort((a,b)=> b.score - a.score);
+                                if (candidates.length) bestFromSrcSet = candidates[0].url;
+                            }
+                            let hrefCandidate = '';
+                            // Chercher un parent lien qui pourrait pointer vers version HD
+                            const linkParent = el.closest('a');
+                            if (linkParent && linkParent.href && !linkParent.href.startsWith('javascript:')) {
+                                hrefCandidate = linkParent.href;
+                            }
                             if (url.startsWith('//')) url = 'https:' + url;
                             else if (url.startsWith('/')) url = window.location.origin + url;
+                            if (bestFromSrcSet) {
+                                if (bestFromSrcSet.startsWith('//')) bestFromSrcSet = 'https:' + bestFromSrcSet;
+                                else if (bestFromSrcSet.startsWith('/')) bestFromSrcSet = window.location.origin + bestFromSrcSet;
+                            }
+                            if (hrefCandidate.startsWith('//')) hrefCandidate = 'https:' + hrefCandidate;
+                            else if (hrefCandidate.startsWith('/')) hrefCandidate = window.location.origin + hrefCandidate;
                             return {
                                 url: url,
+                                srcsetBest: bestFromSrcSet || '',
+                                href: hrefCandidate || '',
                                 filename: (el.alt ? el.alt.replace(/[<>:"/\\|?*]/g, '_') : (tag + '_' + idx + '.jpg')),
                                 thumbnail: url
                             };
@@ -116,7 +145,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 // Normaliser structure à {url, filename}
                 list.push({
                     url: img.url,
-                    filename: img.filename || (tag + '_' + list.length + '.jpg')
+                    filename: img.filename || (tag + '_' + list.length + '.jpg'),
+                    srcsetBest: img.srcsetBest || '',
+                    href: img.href || ''
                 });
             });
         });
@@ -228,6 +259,11 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         // Ajouter dynamiquement la propriété images attendue par le background
         pageData.images = unified;
+        pageData.highRes = document.getElementById('highResCheckbox')?.checked || false;
+
+        if (pageData.highRes) {
+            showStatus('Mode haute résolution: recherche des meilleures sources...', 'info');
+        }
 
         downloadBtn.disabled = true;
         progressDiv.style.display = 'block';

@@ -8,8 +8,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
 async function downloadImagesAsZip(pageData, sendResponse) {
     try {
-        const images = pageData.images;
-        let downloadedCount = 0;
+    const images = pageData.images;
+    const useHighRes = !!pageData.highRes;
+    let downloadedCount = 0;
+    let improvedCount = 0; // nombre d images dont l URL a changé pour une version supposée plus grande
         const zipFiles = [];
         const errorReasons = [];
         
@@ -18,11 +20,156 @@ async function downloadImagesAsZip(pageData, sendResponse) {
             return;
         }
         
-        // Fonction pour télécharger une image
+        async function resolveHighResURL(imageData) {
+            // Construit une liste de candidates ordonnées avec heuristiques
+            const candidates = [];
+            const push = (u, reason, weight=1) => {
+                if (!u) return; candidates.push({ url: u, reason, weight }); };
+            const baseUrl = imageData.url;
+            push(baseUrl, 'base', 1);
+            if (imageData.srcsetBest && imageData.srcsetBest !== baseUrl) push(imageData.srcsetBest, 'srcset', 5);
+            if (imageData.href && imageData.href !== baseUrl) push(imageData.href, 'href', 2);
+
+            // Extraction des query params potentiellement réducteurs (width, w, h, height, size) -> version sans
+            try {
+                const uObj = new URL(baseUrl);
+                const paramsToRemove = ['w','h','width','height','size','quality','q'];
+                let modified = false;
+                paramsToRemove.forEach(p=>{ if (uObj.searchParams.has(p)) { uObj.searchParams.delete(p); modified = true; }});
+                if (modified) push(uObj.toString(), 'no-query-size', 4);
+            } catch(e) {}
+
+            // Pattern dimensions dans le nom de fichier : _640x800, -640x800, 640x800
+            const dimensionPattern = /(\b|_|-)(\d{2,5})x(\d{2,5})(\b|_|\.)/i;
+            if (dimensionPattern.test(baseUrl)) {
+                const cleaned = baseUrl.replace(dimensionPattern, '$1$4');
+                if (cleaned !== baseUrl) push(cleaned, 'strip-dims', 4);
+            }
+
+            // Variation en retirant suffixes numériques à la fin avant extension (ex: image-640x800.jpg -> image.jpg)
+            const suffixPattern = /(-|_)(\d{2,5})x(\d{2,5})(?=\.[a-z]{2,5})(.*)$/i;
+            if (suffixPattern.test(baseUrl)) {
+                const cleaned2 = baseUrl.replace(suffixPattern, '$4');
+                if (cleaned2 && cleaned2 !== baseUrl) push(cleaned2, 'strip-suffix-dims', 4);
+            }
+
+            // Rewriting patterns
+            const rewritePatterns = [
+                [/(-|_|\.)thumb(\.|_|$)/i, '$1$2'],
+                [/(-|_|\.)small(\.|_|$)/i, '$1$2'],
+                [/(-|_|)preview(\.|_|$)/i, '$1$2'],
+                [/(-|_|)low(res)?(\.|_|$)/i, '$1$3'],
+                [/([\/?])thumbs([\/])/i, '$1$2'],
+                [/([\/?])small([\/])/i, '$1$2']
+            ];
+            rewritePatterns.forEach(p => {
+                if (p[0].test(baseUrl)) {
+                    push(baseUrl.replace(p[0], p[1]), 'rewrite', 3);
+                }
+            });
+
+            // Déduplication
+            const seen = new Set();
+            const ordered = candidates.filter(c => {
+                if (seen.has(c.url)) return false; seen.add(c.url); return true; }).sort((a,b)=> b.weight - a.weight);
+
+            // Si href est une page HTML on essaie d extraire toutes les <img> et choisir la plus probable
+            if (pageData.highRes && imageData.href && !/\.(jpe?g|png|webp|gif|avif|bmp|svg)(\?|#|$)/i.test(imageData.href)) {
+                try {
+                    const html = await fetch(imageData.href).then(r=> r.ok ? r.text(): '');
+                    if (html) {
+                        const imgs = [...html.matchAll(/<img[^>]+src=["']([^"'>]+)["'][^>]*>/gi)].map(m=>m[1]);
+                        imgs.forEach(src => {
+                            let u = src;
+                            if (u.startsWith('//')) u = 'https:' + u; else if (u.startsWith('/')) {
+                                try { const base = new URL(imageData.href); u = base.origin + u; } catch(e) {}
+                            }
+                            const score = /large|full|orig|hd|big/i.test(u) ? 6 : 2;
+                            push(u, 'href-img', score);
+                        });
+                    }
+                } catch(e) { /* ignore */ }
+            }
+            const finalList = ordered.sort((a,b)=> b.weight - a.weight).slice(0,15); // limiter
+            return finalList.map(c=>c.url);
+        }
+
+        // Fonction pour télécharger une image (avec résolution high-res)
         async function downloadImage(imageData, index) {
             try {
                 let arrayBuffer;
-                const url = imageData.url;
+                let url = imageData.url;
+                if (useHighRes) {
+                    const candidates = await resolveHighResURL(imageData);
+                    let best = { size: -1, buffer: null, url: null };
+                    for (const candidate of candidates) {
+                        url = candidate;
+                        try {
+                            if (url.startsWith('data:') || url.startsWith('blob:')) { best.url = url; break; }
+                            const resp = await fetch(url, { method: 'GET', mode: 'cors' });
+                            if (!resp.ok) { errorReasons.push('HTTP ' + resp.status); continue; }
+                            const buf = await resp.arrayBuffer();
+                            const size = buf.byteLength;
+                            if (size > best.size) {
+                                best = { size, buffer: buf, url };
+                            }
+                            // heuristique : si on dépasse 1.5MB on suppose HQ suffisante, on arrête
+                            if (best.size > 1.5 * 1024 * 1024) break;
+                        } catch(e) {
+                            errorReasons.push('fetch fail');
+                            continue;
+                        }
+                    }
+                    if (best.buffer) {
+                        if (best.url && best.url !== imageData.url) improvedCount++;
+                        arrayBuffer = best.buffer;
+                        url = best.url;
+                    }
+                    if (!arrayBuffer && (url.startsWith('data:') || url.startsWith('blob:'))) {
+                        // tomber ensuite sur gestion générique plus bas
+                    }
+                }
+                if (!arrayBuffer) {
+                    // chemin standard
+                    if (url.startsWith('data:')) {
+                        const base64 = url.split(',')[1];
+                        arrayBuffer = Uint8Array.from(atob(base64), c => c.charCodeAt(0)).buffer;
+                    } else if (url.startsWith('blob:')) {
+                        const tabId = pageData.tabId;
+                        if (typeof tabId === 'number') {
+                            try {
+                                const result = await new Promise((resolve, reject) => {
+                                    chrome.tabs.executeScript(tabId, {
+                                        code: `fetch('${url}').then(r=>r.arrayBuffer()).then(b=>{ Array.from(new Uint8Array(b)) }).catch(e=>'ERROR:'+e.message);`
+                                    }, res => {
+                                        if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                        else resolve(res && res[0]);
+                                    });
+                                });
+                                if (typeof result === 'string' && result.startsWith('ERROR:')) {
+                                    console.warn('Échec blob fetch', result);
+                                    errorReasons.push('blob fetch');
+                                    return null;
+                                }
+                                arrayBuffer = new Uint8Array(result).buffer;
+                            } catch(e) {
+                                console.warn('Blob non récupéré', e);
+                                errorReasons.push('blob exception');
+                                return null;
+                            }
+                        } else {
+                            return null;
+                        }
+                    } else {
+                        const response = await fetch(url, { mode: 'cors' });
+                        if (!response.ok) {
+                            console.warn(`Échec du téléchargement de l'image ${index + 1}: ${response.status}`);
+                            errorReasons.push('HTTP ' + response.status);
+                            return null;
+                        }
+                        arrayBuffer = await response.arrayBuffer();
+                    }
+                }
                 if (url.startsWith('data:')) {
                     // data URI direct
                     const base64 = url.split(',')[1];
@@ -134,6 +281,7 @@ async function downloadImagesAsZip(pageData, sendResponse) {
                     success: true, 
                     downloadId: downloadId,
                     downloadedCount: downloadedCount,
+                    improvedCount: improvedCount,
                     totalCount: images.length
                 });
             }
